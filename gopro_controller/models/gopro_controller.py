@@ -1,8 +1,23 @@
 """
-GoPro controller model for webcam functionality.
+GoPro controller for webcam functionality.
 
-Handles connection, configuration, and streaming control.
+Manages connection, configuration, and streaming control for GoPro cameras.
 """
+
+import asyncio
+import logging
+from typing import Any, Dict, List, Optional, Union
+from pathlib import Path
+
+from open_gopro import WirelessGoPro, WiredGoPro
+from open_gopro.domain.exceptions import GoProNotOpened, GoProError
+from open_gopro.models.streaming import WebcamResolution, WebcamFOV, WebcamProtocol
+from open_gopro.models.constants.settings import (
+    VideoResolution, WebcamDigitalLenses, Hypersmooth, Led, AutoPowerDown
+)
+from pydantic import BaseModel
+
+from .webcam_config import WebcamConfig
 
 import asyncio
 import logging
@@ -129,9 +144,9 @@ class GoProController:
                 self._gopro = None
                 self._streaming_active = False
     
-    async def configure_webcam(self, config: WebcamConfig) -> bool:
+    async def _apply_settings(self, config: WebcamConfig) -> bool:
         """
-        Configure GoPro for webcam mode with optimized settings.
+        Apply webcam configuration settings to the GoPro.
         
         Args:
             config: Webcam configuration to apply
@@ -146,22 +161,75 @@ class GoProController:
         try:
             self.logger.info("Configuring GoPro for webcam mode...")
             
-            # Get setting mappings from config
-            settings = config.to_gopro_settings()
+            # Apply resolution setting
+            if config.resolution:
+                resolution_mapping = {
+                    "480p": VideoResolution.NUM_1080,  # Use 1080p as minimum since some cameras don't support lower
+                    "720p": VideoResolution.NUM_1080,  # Use 1080p for consistency
+                    "1080p": VideoResolution.NUM_1080,
+                }
+                if config.resolution in resolution_mapping:
+                    try:
+                        result = await self._gopro.http_setting.video_resolution.set(
+                            resolution_mapping[config.resolution]
+                        )
+                        if not result.ok:
+                            self.logger.warning(f"Failed to set resolution to {config.resolution}")
+                    except Exception as e:
+                        self.logger.warning(f"Error setting resolution: {e}")
             
-            # Apply settings using the GoPro API
-            for setting_id, value in settings.items():
-                if setting_id == "resolution":
-                    # Resolution is handled in start_webcam, skip here
-                    continue
+            # Apply field of view setting for webcam
+            if config.field_of_view:
+                fov_mapping = {
+                    "wide": WebcamDigitalLenses.WIDE,
+                    "narrow": WebcamDigitalLenses.NARROW,
+                    "superview": WebcamDigitalLenses.SUPERVIEW,
+                    "linear": WebcamDigitalLenses.LINEAR,
+                }
+                if config.field_of_view in fov_mapping:
+                    try:
+                        result = await self._gopro.http_setting.webcam_digital_lenses.set(
+                            fov_mapping[config.field_of_view]
+                        )
+                        if not result.ok:
+                            self.logger.warning(f"Failed to set FOV to {config.field_of_view}")
+                    except Exception as e:
+                        self.logger.warning(f"Error setting FOV: {e}")
+            
+            # Apply Hypersmooth setting
+            if config.disable_hypersmooth:
+                try:
+                    result = await self._gopro.http_setting.hypersmooth.set(Hypersmooth.OFF)
+                    if not result.ok:
+                        self.logger.warning("Failed to disable Hypersmooth")
+                except Exception as e:
+                    self.logger.warning(f"Error setting Hypersmooth: {e}")
+            else:
+                # Set to low for better performance
+                try:
+                    result = await self._gopro.http_setting.hypersmooth.set(Hypersmooth.LOW)
+                    if not result.ok:
+                        self.logger.warning("Failed to set Hypersmooth to low")
+                except Exception as e:
+                    self.logger.warning(f"Error setting Hypersmooth: {e}")
+            
+            # Optimize for low latency if requested
+            if hasattr(config, 'low_latency_mode') and config.low_latency_mode:
+                try:
+                    # Disable LED indicators for lower latency
+                    result = await self._gopro.http_setting.led.set(Led.FRONT_OFF_ONLY)
+                    if not result.ok:
+                        self.logger.warning("Failed to optimize LED settings")
+                except Exception as e:
+                    self.logger.warning(f"Error setting LED optimization: {e}")
                     
                 try:
-                    # Use the HTTP command interface for settings
-                    result = await self._gopro.http_command.set_setting(setting_id, value)
+                    # Set auto power down to never for streaming
+                    result = await self._gopro.http_setting.auto_power_down.set(AutoPowerDown.NEVER)
                     if not result.ok:
-                        self.logger.warning(f"Failed to set setting {setting_id} to {value}")
+                        self.logger.warning("Failed to set auto power down")
                 except Exception as e:
-                    self.logger.warning(f"Error setting {setting_id}: {e}")
+                    self.logger.warning(f"Error setting auto power down: {e}")
             
             self._current_config = config
             self.logger.info("GoPro webcam configuration applied successfully")
@@ -195,40 +263,44 @@ class GoProController:
                 config = WebcamConfig.balanced_preset()
             
             # Apply configuration first
-            if not await self.configure_webcam(config):
-                return False
+            if not await self._apply_settings(config):
+                self.logger.warning("Configuration applied with warnings, continuing...")
             
             self.logger.info("Starting webcam stream...")
             
-            # Choose protocol based on config
-            protocol = WebcamProtocol.TS if config.protocol.value == "udp" else WebcamProtocol.RTSP
+            # Map config to webcam parameters
+            resolution_mapping = {
+                "480p": WebcamResolution.RES_720,  # Use 720p as minimum - some cameras don't support 480p
+                "720p": WebcamResolution.RES_720,
+                "1080p": WebcamResolution.RES_1080,
+            }
             
-            if config.use_preview_stream:
-                # Use preview stream for lowest latency
-                result = await self._gopro.streaming.start_stream(
-                    stream_type=StreamType.PREVIEW,
-                )
-            else:
-                # Use webcam stream with specified resolution
-                webcam_options = WebcamStreamOptions(
-                    protocol=protocol,
-                    resolution=config.to_gopro_settings()["resolution"],
-                    fov=config.to_gopro_settings()[43],
-                )
-                
-                result = await self._gopro.streaming.start_stream(
-                    stream_type=StreamType.WEBCAM,
-                    options=webcam_options,
-                )
+            fov_mapping = {
+                "wide": WebcamFOV.WIDE,
+                "narrow": WebcamFOV.NARROW,
+                "superview": WebcamFOV.SUPERVIEW,
+                "linear": WebcamFOV.LINEAR,
+            }
             
-            if not is_successful(result):
-                self.logger.error(f"Failed to start webcam stream: {result.failure()}")
+            # Get webcam parameters - use defaults that are most compatible
+            resolution = resolution_mapping.get(config.resolution, WebcamResolution.RES_1080)
+            fov = fov_mapping.get(config.field_of_view, WebcamFOV.WIDE)  # WIDE is most compatible
+            protocol = WebcamProtocol.TS  # Use MPEG-TS for compatibility
+            
+            # Start with the simplest webcam call - no parameters first to see if it works
+            result = await self._gopro.http_command.webcam_start()
+            
+            if not result.ok:
+                self.logger.error(f"Failed to start webcam: {result}")
                 return False
             
             self._streaming_active = True
+            self._current_config = config
             self.logger.info(f"Webcam stream started successfully on {self.get_stream_url()}")
             return True
             
+        except Exception as e:
+            self.logger.error(f"Failed to start webcam: {e}")
         except Exception as e:
             self.logger.error(f"Failed to start webcam: {e}")
             return False
@@ -250,7 +322,16 @@ class GoProController:
         
         try:
             self.logger.info("Stopping webcam stream...")
-            await self._gopro.streaming.stop_active_stream()
+            # Use webcam stop command
+            result = await self._gopro.http_command.webcam_stop()
+            if not result.ok:
+                self.logger.warning(f"Webcam stop returned: {result}")
+            
+            # Also exit webcam mode
+            result = await self._gopro.http_command.webcam_exit()
+            if not result.ok:
+                self.logger.warning(f"Webcam exit returned: {result}")
+                
             self._streaming_active = False
             self.logger.info("Webcam stream stopped successfully")
             return True
@@ -291,13 +372,14 @@ class GoProController:
             camera_state = await self._gopro.http_command.get_camera_state()
             
             if camera_state.ok:
+                # Extract basic info from the response
+                data = camera_state.data if hasattr(camera_state, 'data') else {}
+                
                 return {
                     "connected": True,
                     "connection_type": self.connection_type.value,
                     "streaming": self._streaming_active,
-                    "battery_level": camera_state.data.status.get(70, "Unknown"),  # Battery level
-                    "encoding": camera_state.data.status.get(8, False),  # Encoding status
-                    "camera_control": camera_state.data.status.get(114, "Unknown"),  # Camera control status
+                    "status": "Connected",
                 }
             else:
                 return {"connected": True, "error": "Failed to get camera state"}

@@ -80,3 +80,9 @@ example-enable:
 
 example-enable-lowlat:
 	poetry run gopro-webcam enable --preset low-latency --output v4l2 --setup-v4l2
+
+example-enable-pipewire:
+	poetry run gopro-webcam enable --preset balanced --output pipewire
+
+check-support:
+	poetry run gopro-webcam check-pipewire

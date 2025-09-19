@@ -6,6 +6,7 @@ Provides commands to connect, configure, and control GoPro cameras as webcams.
 
 import asyncio
 import logging
+import signal
 import sys
 from pathlib import Path
 from typing import Optional
@@ -18,7 +19,7 @@ from rich.table import Table
 
 from ..models.gopro_controller import GoProController, ConnectionType
 from ..models.webcam_config import WebcamConfig
-from ..stream_consumers import V4L2Consumer, V4L2ConsumerConfig
+from ..stream_consumers import V4L2Consumer, V4L2ConsumerConfig, PipeWireConsumer, PipeWireConsumerConfig
 
 
 console = Console()
@@ -61,12 +62,14 @@ def cli(ctx: click.Context, verbose: bool, identifier: Optional[str], wired: boo
 @click.option("--fov", type=click.Choice(["wide", "narrow", "superview", "linear"]), 
               help="Override field of view setting")
 @click.option("--no-optimization", is_flag=True, help="Disable latency optimizations")
-@click.option("--output", type=click.Choice(["none", "v4l2"]), default="none",
+@click.option("--output", type=click.Choice(["none", "v4l2", "pipewire"]), default="none",
               help="Stream output type")
 @click.option("--v4l2-device", default="/dev/video42", 
               help="V4L2 device path (when using --output v4l2)")
 @click.option("--setup-v4l2", is_flag=True, 
               help="Automatically setup v4l2loopback device")
+@click.option("--pipewire-node", default="GoPro Camera",
+              help="PipeWire node name (when using --output pipewire)")
 @click.pass_context
 def enable(
     ctx: click.Context, 
@@ -77,9 +80,10 @@ def enable(
     output: str,
     v4l2_device: str,
     setup_v4l2: bool,
+    pipewire_node: str,
 ) -> None:
     """Enable webcam mode on the GoPro."""
-    asyncio.run(_enable_webcam(ctx, preset, resolution, fov, no_optimization, output, v4l2_device, setup_v4l2))
+    asyncio.run(_enable_webcam(ctx, preset, resolution, fov, no_optimization, output, v4l2_device, setup_v4l2, pipewire_node))
 
 
 async def _enable_webcam(
@@ -91,6 +95,7 @@ async def _enable_webcam(
     output: str,
     v4l2_device: str,
     setup_v4l2: bool,
+    pipewire_node: str,
 ) -> None:
     """Async implementation of enable command."""
     
@@ -182,28 +187,88 @@ async def _enable_webcam(
                                 console.print(f"[yellow]You can now use {v4l2_device} as a webcam in your applications")
                             else:
                                 console.print("[red]Failed to start V4L2 output")
+
+                elif output == "pipewire" and stream_url:
+                    console.print(f"\n[blue]Setting up PipeWire output as '{pipewire_node}'...")
+                    
+                    pipewire_config = PipeWireConsumerConfig(
+                        stream_url=stream_url,
+                        node_name=pipewire_node,
+                        client_name="GoPro Webcam Controller",
+                        format="mpegts-h264",  # GoPro uses MPEG-TS
+                        jitter_ms=0,  # LAN - no jitter buffer needed
+                        prefer_hardware_decode=True,
+                    )
+                    
+                    stream_consumer = PipeWireConsumer(pipewire_config)
+                    
+                    # Validate requirements
+                    missing = stream_consumer.validate_requirements()
+                    if missing:
+                        console.print(f"[red]Missing requirements for PipeWire output: {', '.join(missing)}")
+                        console.print("[yellow]Stream will continue without PipeWire output")
+                        console.print("[blue]Install: sudo dnf install python3-gobject gstreamer1 gstreamer1-plugins-*")
+                    else:
+                        with console.status("[blue]Starting PipeWire stream consumer..."):
+                            if await stream_consumer.start():
+                                console.print(f"[green]✓[/green] PipeWire node active: '{pipewire_node}'")
+                                console.print(f"[yellow]You can now select '{pipewire_node}' as a camera in your applications")
+                                
+                                # Show hardware decoder info
+                                output_info = stream_consumer.get_output_info()
+                                if hasattr(stream_consumer, '_choose_h264_decoder'):
+                                    decoder = stream_consumer._choose_h264_decoder()
+                                    console.print(f"[dim]Using decoder: {decoder}")
+                            else:
+                                console.print("[red]Failed to start PipeWire output")
                 
                 # Keep running until user interrupts
                 if output == "none":
                     console.print(f"\n[yellow]Webcam stream is active at {stream_url}")
                     console.print("[yellow]Press Ctrl+C to stop.")
+                elif output == "v4l2":
+                    console.print("\n[yellow]V4L2 virtual webcam is now active. Press Ctrl+C to stop.[/yellow]")
+                elif output == "pipewire":
+                    console.print("\n[yellow]PipeWire virtual camera is now active. Press Ctrl+C to stop.[/yellow]")
                 else:
                     console.print("\n[yellow]Webcam is now active. Press Ctrl+C to stop.[/yellow]")
                 
+                # Set up signal handler for clean shutdown
+                shutdown_event = asyncio.Event()
+                
+                def signal_handler():
+                    shutdown_event.set()
+                
+                # Register signal handler
+                loop = asyncio.get_event_loop()
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    loop.add_signal_handler(sig, signal_handler)
+                
                 try:
-                    while True:
-                        await asyncio.sleep(1)
+                    # Wait for shutdown signal
+                    await shutdown_event.wait()
                 except KeyboardInterrupt:
+                    pass
+                finally:
                     console.print("\n[blue]Stopping webcam...")
                     
                     # Stop stream consumer first
                     if stream_consumer:
-                        await stream_consumer.stop()
-                        console.print("[green]✓[/green] V4L2 output stopped")
+                        try:
+                            await stream_consumer.stop()
+                            if output == "v4l2":
+                                console.print("[green]✓[/green] V4L2 output stopped")
+                            elif output == "pipewire":
+                                console.print("[green]✓[/green] PipeWire output stopped")
+                        except Exception as e:
+                            console.print(f"[yellow]Warning: Error stopping stream consumer: {e}")
                     
                     # Stop webcam
-                    await controller.stop_webcam()
-                    console.print("[green]✓[/green] Webcam stopped")
+                    try:
+                        await controller.stop_webcam()
+                        console.print("[green]✓[/green] Webcam stopped")
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: Error stopping webcam: {e}")
                     
     except KeyboardInterrupt:
         console.print("\n[blue]Operation cancelled")
@@ -307,6 +372,60 @@ def list_devices() -> None:
     
     console.print(table)
     console.print(f"\n[blue]Found {len(devices)} V4L2 device(s)")
+
+
+@cli.command()
+def check_pipewire() -> None:
+    """Check PipeWire support status."""
+    console.print("\n[bold]PipeWire Support Status:[/bold]\n")
+    
+    status = PipeWireConsumer.check_pipewire_support()
+    
+    table = Table(show_header=True, header_style="bold blue")
+    table.add_column("Component", style="cyan")
+    table.add_column("Status", style="green")
+    
+    # GStreamer availability
+    gst_status = "✅ Available" if status["gstreamer_available"] else "❌ Missing"
+    table.add_row("GStreamer Python", gst_status)
+    
+    # PipeWire service
+    pw_status = "✅ Running" if status["pipewire_running"] else "❌ Not running"
+    table.add_row("PipeWire Service", pw_status)
+    
+    # PipeWire sink
+    sink_status = "✅ Available" if status["pipewiresink_available"] else "❌ Missing"
+    table.add_row("PipeWire GStreamer Sink", sink_status)
+    
+    # H.264 decoders
+    decoders = status["h264_decoders"]
+    if decoders:
+        decoder_list = ", ".join(decoders)
+        table.add_row("H.264 Decoders", f"✅ {decoder_list}")
+    else:
+        table.add_row("H.264 Decoders", "❌ None found")
+    
+    console.print(table)
+    
+    # Installation hints
+    if not status["gstreamer_available"]:
+        console.print("\n[yellow]To install GStreamer:")
+        console.print("  Fedora: sudo dnf install python3-gobject gstreamer1 gstreamer1-plugins-*")
+        console.print("  Ubuntu: sudo apt install python3-gi gstreamer1.0-* python3-gst-1.0")
+        console.print("  Arch:   sudo pacman -S python-gobject gst-plugins-base gst-plugins-good")
+    
+    if not status["pipewire_running"]:
+        console.print("\n[yellow]To start PipeWire:")
+        console.print("  systemctl --user enable --now pipewire")
+    
+    # Overall recommendation
+    all_good = (status["gstreamer_available"] and status["pipewire_running"] and 
+                status["pipewiresink_available"] and len(status["h264_decoders"]) > 0)
+    
+    if all_good:
+        console.print("\n[green]✅ PipeWire consumer ready to use!")
+    else:
+        console.print("\n[red]❌ PipeWire consumer not ready - install missing components")
 
 
 @cli.command()

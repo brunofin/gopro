@@ -18,10 +18,12 @@ rich = "^14"
 click = "^8"
 pydantic = "^2"
 asyncio-mqtt = {version = "^0", optional = true}
+PyGObject = {version = "^3.42", optional = true}
 
 [tool.poetry.extras]
 gui = ["PyGObject"]
-pipewire = ["asyncio-mqtt"]
+pipewire = ["PyGObject"]
+all = ["PyGObject", "asyncio-mqtt"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8"
